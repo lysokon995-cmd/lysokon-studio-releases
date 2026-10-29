@@ -25,10 +25,17 @@ jobs:
   installed-app:
     runs-on: windows-2022
     timeout-minutes: 25
-    env:
-      SMOKE_ROOT: ${{ runner.temp }}/lysokon-smoke
-      MODEL_CACHE: ${{ runner.temp }}/lysokon-smoke/profile/AI/Models
     steps:
+      - name: Initialize isolated verification paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'lysokon-smoke'
+          $modelCache = Join-Path $smokeRoot 'profile/AI/Models'
+          New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+          "SMOKE_ROOT=$smokeRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MODEL_CACHE=$modelCache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       # The release repository contains this workflow and release assets only.
       # No private application source is checked out or copied to this runner.
       - name: Download the selected draft installer
@@ -43,11 +50,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:SMOKE_ROOT | Out-Null
           $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,assets | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $release.tagName -ne $env:RELEASE_TAG -or -not $release.isDraft) { throw 'The requested draft release does not exist.' }
-          $asset = @($release.assets | Where-Object { $_.name -eq 'Новый.exe' })
-          if ($asset.Count -ne 1) { throw 'Draft must contain exactly one Новый.exe installer.' }
-          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern 'Новый.exe' --dir $env:SMOKE_ROOT
+          $asset = @($release.assets | Where-Object { $_.name -eq 'Novy-Setup.exe' })
+          if ($asset.Count -ne 1) { throw 'Draft must contain exactly one Novy-Setup.exe installer.' }
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern 'Novy-Setup.exe' --dir $env:SMOKE_ROOT
           if ($LASTEXITCODE -ne 0) { throw 'Installer download failed.' }
-          $installer = Join-Path $env:SMOKE_ROOT 'Новый.exe'
+          $installer = Join-Path $env:SMOKE_ROOT 'Novy-Setup.exe'
           if ((Get-Item $installer).Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
           Get-FileHash -Algorithm SHA256 $installer | Format-List | Out-File (Join-Path $env:SMOKE_ROOT 'installer-sha256.txt')
 
@@ -63,7 +70,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-          $installer = Start-Process -FilePath (Join-Path $env:SMOKE_ROOT 'Новый.exe') -ArgumentList '/S' -PassThru
+          $installer = Start-Process -FilePath (Join-Path $env:SMOKE_ROOT 'Novy-Setup.exe') -ArgumentList '/S' -PassThru
           if (-not $installer.WaitForExit(180000)) { $installer.Kill($true); throw 'Installer exceeded three minutes.' }
           if ($installer.ExitCode -ne 0) { throw "Installer failed with exit $($installer.ExitCode)." }
           # NSIS may launch the app at the end. Stop that fresh instance before selecting the CI profile.
