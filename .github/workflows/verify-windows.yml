@@ -1,0 +1,120 @@
+name: Verify Windows installer
+run-name: Windows ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag to verify
+        required: true
+        type: string
+      inference:
+        description: Download Qwen3.5 2B and run actual CPU inference
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-installer-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  installed-app:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      SMOKE_ROOT: ${{ runner.temp }}/lysokon-smoke
+      MODEL_CACHE: ${{ runner.temp }}/lysokon-smoke/profile/AI/Models
+    steps:
+      # The release repository contains this workflow and release assets only.
+      # No private application source is checked out or copied to this runner.
+      - name: Download the selected draft installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -ne 'lysokon995-cmd/lysokon-studio-releases') { throw 'Unexpected release repository.' }
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$') { throw 'Invalid release tag.' }
+          New-Item -ItemType Directory -Force -Path $env:SMOKE_ROOT | Out-Null
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.tagName -ne $env:RELEASE_TAG -or -not $release.isDraft) { throw 'The requested draft release does not exist.' }
+          $asset = @($release.assets | Where-Object { $_.name -eq 'Новый.exe' })
+          if ($asset.Count -ne 1) { throw 'Draft must contain exactly one Новый.exe installer.' }
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern 'Новый.exe' --dir $env:SMOKE_ROOT
+          if ($LASTEXITCODE -ne 0) { throw 'Installer download failed.' }
+          $installer = Join-Path $env:SMOKE_ROOT 'Новый.exe'
+          if ((Get-Item $installer).Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
+          Get-FileHash -Algorithm SHA256 $installer | Format-List | Out-File (Join-Path $env:SMOKE_ROOT 'installer-sha256.txt')
+
+      - name: Restore only the local model cache
+        if: ${{ inputs.inference }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified from official actions/cache
+        with:
+          path: ${{ env.MODEL_CACHE }}
+          key: windows-x64-ollama-qwen3.5-2b-q4_K_M-v1
+
+      - name: Install the packaged application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $installer = Start-Process -FilePath (Join-Path $env:SMOKE_ROOT 'Новый.exe') -ArgumentList '/S' -PassThru
+          if (-not $installer.WaitForExit(180000)) { $installer.Kill($true); throw 'Installer exceeded three minutes.' }
+          if ($installer.ExitCode -ne 0) { throw "Installer failed with exit $($installer.ExitCode)." }
+          # NSIS may launch the app at the end. Stop that fresh instance before selecting the CI profile.
+          Get-Process -Name Novy -ErrorAction SilentlyContinue | Stop-Process -Force
+          $programs = Join-Path $env:LOCALAPPDATA 'Programs'
+          $executables = @(Get-ChildItem -LiteralPath $programs -Recurse -Filter 'Novy.exe' -File -ErrorAction SilentlyContinue)
+          if ($executables.Count -ne 1) { throw "Expected one installed Novy.exe, found $($executables.Count)." }
+          $exe = $executables[0].FullName
+          $resources = Join-Path $executables[0].DirectoryName 'resources'
+          if (-not (Test-Path (Join-Path $resources 'app.asar'))) { throw 'Packaged app.asar is missing.' }
+          if (-not (Test-Path (Join-Path $resources 'AI/ollama.exe'))) { throw 'Bundled Ollama is missing.' }
+          "INSTALLED_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $exe | Out-File (Join-Path $env:SMOKE_ROOT 'installed-path.txt')
+
+      - name: Launch installed build and verify actual inference
+        shell: pwsh
+        env:
+          CI: 'true'
+          LYSOKON_SMOKE_INFERENCE: ${{ inputs.inference && '1' || '0' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Tokens are step scoped above. Explicit removal also protects future workflow edits.
+          Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $env:LYSOKON_SMOKE_REPORT = Join-Path $env:SMOKE_ROOT 'report.json'
+          $process = Start-Process -FilePath $env:INSTALLED_EXE -ArgumentList '--smoke-test', '--enable-logging=stderr' -PassThru -RedirectStandardOutput (Join-Path $env:SMOKE_ROOT 'stdout.log') -RedirectStandardError (Join-Path $env:SMOKE_ROOT 'stderr.log')
+          $deadline = [DateTime]::UtcNow.AddMinutes(20)
+          while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds 5
+            $process.Refresh()
+          }
+          if (-not $process.HasExited) { $process.Kill($true); throw 'Installed app smoke exceeded twenty minutes.' }
+          if (-not (Test-Path $env:LYSOKON_SMOKE_REPORT)) { throw "No smoke report; app exit was $($process.ExitCode)." }
+          $report = Get-Content -Raw -LiteralPath $env:LYSOKON_SMOKE_REPORT | ConvertFrom-Json
+          $report.checks | Select-Object name, ok, durationMs | Format-Table -AutoSize
+          if ($process.ExitCode -ne 0 -or -not $report.ok -or $report.exitCode -ne 0) { throw "Installed app verification failed (exit $($process.ExitCode))." }
+          if ($env:LYSOKON_SMOKE_INFERENCE -eq '1' -and -not $report.inference) { throw 'Actual inference was not exercised.' }
+
+      - name: Preserve verification report and logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified from official actions/upload-artifact
+        with:
+          name: windows-smoke-${{ inputs.tag }}
+          path: |
+            ${{ env.SMOKE_ROOT }}/report.json
+            ${{ env.SMOKE_ROOT }}/*.log
+            ${{ env.SMOKE_ROOT }}/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop remaining test processes
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Get-Process -Name Novy, ollama -ErrorAction SilentlyContinue | Stop-Process -Force
