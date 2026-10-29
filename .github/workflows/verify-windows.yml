@@ -56,7 +56,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installer download failed.' }
           $installer = Join-Path $env:SMOKE_ROOT 'Novy-Setup.exe'
           if ((Get-Item $installer).Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
-          Get-FileHash -Algorithm SHA256 $installer | Format-List | Out-File (Join-Path $env:SMOKE_ROOT 'installer-sha256.txt')
+          $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          @{ tag = $env:RELEASE_TAG; sha256 = $hash; size = (Get-Item $installer).Length } | ConvertTo-Json | Set-Content (Join-Path $env:SMOKE_ROOT 'installer-sha256.json')
+          # Verify the ordinary upgrade path from the latest published build.
+          $releases = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,isDraft,isPrerelease | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect previous published release.' }
+          $previous = $releases | Where-Object { -not $_.isDraft -and -not $_.isPrerelease } | Select-Object -First 1
+          if ($previous) {
+            if ($previous.tagName -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or $previous.tagName -eq $env:RELEASE_TAG) { throw 'Unexpected predecessor tag.' }
+            $directory = Join-Path $env:SMOKE_ROOT 'previous'
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+            gh release download $previous.tagName --repo $env:GITHUB_REPOSITORY --pattern 'Novy-Setup.exe' --dir $directory
+            if ($LASTEXITCODE -ne 0) { throw 'Previous installer download failed.' }
+            "PREVIOUS_INSTALLER=$(Join-Path $directory 'Novy-Setup.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "PREVIOUS_TAG=$($previous.tagName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
 
       - name: Restore only the local model cache
         if: ${{ inputs.inference }}
@@ -65,12 +79,49 @@ jobs:
           path: ${{ env.MODEL_CACHE }}
           key: windows-x64-ollama-qwen3.5-2b-q4_K_M-v1
 
+      - name: Create real prior-version data for the upgrade check
+        if: ${{ env.PREVIOUS_INSTALLER != '' }}
+        shell: pwsh
+        env:
+          CI: 'true'
+          LYSOKON_SMOKE_INFERENCE: '0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          $installer = Start-Process -FilePath $env:PREVIOUS_INSTALLER -ArgumentList '/S' -PassThru
+          if (-not $installer.WaitForExit(180000)) { $installer.Kill($true); throw 'Previous installation timed out.' }
+          if ($installer.ExitCode -ne 0) { throw 'Previous installation failed.' }
+          Get-Process -Name Novy -ErrorAction SilentlyContinue | Stop-Process -Force
+          $executables = @(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Filter 'Novy.exe' -File)
+          if ($executables.Count -ne 1) { throw 'Expected one previous application.' }
+          $env:LYSOKON_SMOKE_REPORT = Join-Path $env:SMOKE_ROOT 'previous/report.json'
+          $process = Start-Process -FilePath $executables[0].FullName -ArgumentList '--smoke-test' -PassThru
+          if (-not $process.WaitForExit(180000)) { $process.Kill($true); throw 'Previous application check timed out.' }
+          if ($process.ExitCode -ne 0) { throw 'Previous application could not save its test data.' }
+          $prior = Get-Content -Raw $env:LYSOKON_SMOKE_REPORT | ConvertFrom-Json
+          if (-not $prior.ok) { throw 'Previous application smoke failed.' }
+          $oldProfile = Join-Path $env:SMOKE_ROOT 'previous/profile'
+          $newProfile = Join-Path $env:SMOKE_ROOT 'profile'
+          New-Item -ItemType Directory -Force -Path $newProfile | Out-Null
+          # Both paths are isolated CI profiles, never a real user's data.
+          Copy-Item -LiteralPath (Join-Path $oldProfile 'tasks.json') -Destination $newProfile
+          $hash = (Get-FileHash -Algorithm SHA256 (Join-Path $newProfile 'tasks.json')).Hash
+          "UPGRADE_TASK_HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $ai = Join-Path $newProfile 'AI'
+          New-Item -ItemType Directory -Force -Path $ai | Out-Null
+          $now = [DateTime]::UtcNow.ToString('o')
+          @{ schemaVersion = 1; facts = @(@{ id = [Guid]::NewGuid().ToString(); text = 'CI upgrade rule: keep this preference'; createdAt = $now; updatedAt = $now }); history = @(@{ role = 'user'; content = 'CI upgrade history'; createdAt = $now }) } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $ai 'assistant-memory.json')
+          @{ notifications = $false; delivered = @('ci-upgrade'); lastWaitingReviewDay = $null } | ConvertTo-Json | Set-Content (Join-Path $newProfile 'settings.json')
+          "UPGRADE_MEMORY_HASH=$((Get-FileHash -Algorithm SHA256 (Join-Path $ai 'assistant-memory.json')).Hash)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "UPGRADE_SETTINGS_HASH=$((Get-FileHash -Algorithm SHA256 (Join-Path $newProfile 'settings.json')).Hash)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LYSOKON_SMOKE_UPGRADE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install the packaged application
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-          $installer = Start-Process -FilePath (Join-Path $env:SMOKE_ROOT 'Novy-Setup.exe') -ArgumentList '/S' -PassThru
+          $installer = Start-Process -FilePath (Join-Path $env:SMOKE_ROOT 'Novy-Setup.exe') -ArgumentList '/S', '--updated' -PassThru
           if (-not $installer.WaitForExit(180000)) { $installer.Kill($true); throw 'Installer exceeded three minutes.' }
           if ($installer.ExitCode -ne 0) { throw "Installer failed with exit $($installer.ExitCode)." }
           # NSIS may launch the app at the end. Stop that fresh instance before selecting the CI profile.
@@ -84,6 +135,12 @@ jobs:
           if (-not (Test-Path (Join-Path $resources 'AI/ollama.exe'))) { throw 'Bundled Ollama is missing.' }
           "INSTALLED_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $exe | Out-File (Join-Path $env:SMOKE_ROOT 'installed-path.txt')
+          if ($env:UPGRADE_TASK_HASH) {
+            $after = (Get-FileHash -Algorithm SHA256 (Join-Path $env:SMOKE_ROOT 'profile/tasks.json')).Hash
+            if ($after -ne $env:UPGRADE_TASK_HASH) { throw 'Installer changed the prior-version task file.' }
+            if ((Get-FileHash -Algorithm SHA256 (Join-Path $env:SMOKE_ROOT 'profile/AI/assistant-memory.json')).Hash -ne $env:UPGRADE_MEMORY_HASH) { throw 'Installer changed assistant memory/history.' }
+            if ((Get-FileHash -Algorithm SHA256 (Join-Path $env:SMOKE_ROOT 'profile/settings.json')).Hash -ne $env:UPGRADE_SETTINGS_HASH) { throw 'Installer changed notification settings.' }
+          }
 
       - name: Launch installed build and verify actual inference
         shell: pwsh
@@ -107,6 +164,8 @@ jobs:
           $report.checks | Select-Object name, ok, durationMs | Format-Table -AutoSize
           if ($process.ExitCode -ne 0 -or -not $report.ok -or $report.exitCode -ne 0) { throw "Installed app verification failed (exit $($process.ExitCode))." }
           if ($env:LYSOKON_SMOKE_INFERENCE -eq '1' -and -not $report.inference) { throw 'Actual inference was not exercised.' }
+          if ($env:LYSOKON_SMOKE_UPGRADE -eq '1' -and -not $report.upgrade) { throw 'Prior-version data was not verified.' }
+          @{ predecessor = $env:PREVIOUS_TAG; upgrade = ($env:LYSOKON_SMOKE_UPGRADE -eq '1') } | ConvertTo-Json | Set-Content (Join-Path $env:SMOKE_ROOT 'upgrade.json')
 
       - name: Preserve verification report and logs
         if: ${{ always() }}
@@ -115,6 +174,8 @@ jobs:
           name: windows-smoke-${{ inputs.tag }}
           path: |
             ${{ env.SMOKE_ROOT }}/report.json
+            ${{ env.SMOKE_ROOT }}/installer-sha256.json
+            ${{ env.SMOKE_ROOT }}/upgrade.json
             ${{ env.SMOKE_ROOT }}/*.log
             ${{ env.SMOKE_ROOT }}/*.txt
           if-no-files-found: warn
