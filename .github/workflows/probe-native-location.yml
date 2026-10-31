@@ -1,0 +1,88 @@
+name: Probe Windows native location phases
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  location-phases:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Disable location on the disposable runner and probe bounded native phases
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'
+          New-Item -Path $policy -Force | Out-Null
+          New-ItemProperty -Path $policy -Name DisableLocation -PropertyType DWord -Value 1 -Force | Out-Null
+          $service = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
+          if ($service) {
+            Stop-Service -Name lfsvc -Force -ErrorAction Stop
+            Set-Service -Name lfsvc -StartupType Disabled
+          }
+          $code = @'
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $WarningPreference = 'SilentlyContinue'
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          $watcher = $null
+          function Phase([string]$name, [string]$detail = 'none') {
+            if ($name -notmatch '^[a-z-]+$' -or $detail -notmatch '^[A-Za-z0-9.+:=-]+$') { return }
+            [Console]::Out.WriteLine(('phase={0}|ms={1}|type={2}' -f $name, $clock.ElapsedMilliseconds, $detail))
+            [Console]::Out.Flush()
+          }
+          Phase 'boot' ('PowerShell' + $PSVersionTable.PSVersion.Major + ':' + [Threading.Thread]::CurrentThread.ApartmentState)
+          try {
+            Phase 'assembly-start'
+            Add-Type -AssemblyName System.Device
+            Phase 'assembly-ready' 'System.Device.Location.GeoCoordinateWatcher'
+            Phase 'constructor-start'
+            $watcher = New-Object System.Device.Location.GeoCoordinateWatcher ([System.Device.Location.GeoPositionAccuracy]::Default)
+            Phase 'constructor-ready' $watcher.GetType().FullName
+            Phase 'permission-before-start'
+            Phase 'permission-before-ready' $watcher.Permission.ToString()
+            Phase 'status-before-start'
+            Phase 'status-before-ready' $watcher.Status.ToString()
+            Phase 'try-start' 'suppressPrompt=true:timeoutMs=5000'
+            $started = $watcher.TryStart($true, [TimeSpan]::FromSeconds(5))
+            Phase 'try-ready' ('started=' + $started.ToString())
+            Phase 'permission-after-start'
+            Phase 'permission-after-ready' $watcher.Permission.ToString()
+            Phase 'status-after-start'
+            Phase 'status-after-ready' $watcher.Status.ToString()
+          } catch {
+            Phase 'api-error' $_.Exception.GetType().FullName
+          } finally {
+            if ($null -ne $watcher) {
+              try { Phase 'stop-start'; $watcher.Stop(); Phase 'stop-ready' } catch { Phase 'stop-error' $_.Exception.GetType().FullName }
+              try { Phase 'dispose-start'; $watcher.Dispose(); Phase 'dispose-ready' } catch { Phase 'dispose-error' $_.Exception.GetType().FullName }
+            }
+          }
+          Phase 'done'
+          '@
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+          foreach ($apartment in @('STA', 'MTA')) {
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $start.Arguments = '-NoLogo -NoProfile -NonInteractive -' + $apartment + ' -EncodedCommand ' + $encoded
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            [void]$process.Start()
+            $outTask = $process.StandardOutput.ReadToEndAsync()
+            $errTask = $process.StandardError.ReadToEndAsync()
+            $finished = $process.WaitForExit(30000)
+            if (-not $finished) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null }
+            $output = $outTask.GetAwaiter().GetResult()
+            $errors = $errTask.GetAwaiter().GetResult()
+            Write-Output ('probe={0}|phase=process-end|ms={1}|type=finished:{2}:exit:{3}' -f $apartment, $clock.ElapsedMilliseconds, $finished, $process.ExitCode)
+            foreach ($line in ($output -split "`r?`n")) {
+              if ($line -match '^phase=[a-z-]+\|ms=[0-9]+\|type=[A-Za-z0-9.+:=-]+$') { Write-Output ('probe=' + $apartment + '|' + $line) }
+            }
+            if ($errors.Length -gt 0) { Write-Output ('probe=' + $apartment + '|phase=stderr|ms=0|type=present') }
+            $process.Dispose()
+          }
