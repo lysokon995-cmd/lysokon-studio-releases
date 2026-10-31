@@ -12,7 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
-      - name: Disable location on the disposable runner and probe bounded native phases
+      - name: Check final helper protocol and timing with OS location disabled
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -20,105 +20,112 @@ jobs:
           New-Item -Path $policy -Force | Out-Null
           New-ItemProperty -Path $policy -Name DisableLocation -PropertyType DWord -Value 1 -Force | Out-Null
           $service = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
-          if ($service) {
-            Stop-Service -Name lfsvc -Force -ErrorAction Stop
-            Set-Service -Name lfsvc -StartupType Disabled
-          }
+          if ($service) { Stop-Service -Name lfsvc -Force -ErrorAction Stop; Set-Service -Name lfsvc -StartupType Disabled }
           $code = @'
+          # One bounded request to the Windows Location Service. No PowerShell cmdlets:
+          # module autoload under the deliberately minimal child environment can stall.
+          # No web API, keys, coordinate files, diagnostics, or continuous event handlers.
           $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $WarningPreference = 'SilentlyContinue'
-          $clock = [Diagnostics.Stopwatch]::StartNew()
           $watcher = $null
-          function Phase([string]$name, [string]$detail = 'none') {
-            if ($name -notmatch '^[a-z-]+$' -or $detail -notmatch '^[A-Za-z0-9.+:=-]+$') { return }
-            [Console]::Out.WriteLine(('phase={0}|ms={1}|type={2}' -f $name, $clock.ElapsedMilliseconds, $detail))
-            [Console]::Out.Flush()
-          }
-          Phase 'boot' ('PowerShell' + $PSVersionTable.PSVersion.Major + ':' + [Threading.Thread]::CurrentThread.ApartmentState)
+          $ready = $false
+          $status = 'api-error'
+          $coordinateJSON = $null
           try {
-            Phase 'assembly-start'
-            __ASSEMBLY_LOAD__
-            Phase 'assembly-ready' 'System.Device.Location.GeoCoordinateWatcher'
-            Phase 'constructor-start'
-            $watcher = __CONSTRUCTOR__
-            Phase 'constructor-ready' $watcher.GetType().FullName
-            Phase 'try-start' '__DETAIL__'
-            $started = $watcher.TryStart(__SUPPRESS__, [TimeSpan]::FromSeconds(__SECONDS__))
-            Phase 'try-ready' ('started=' + $started.ToString())
-            Phase 'permission-after-start'
-            Phase 'permission-after-ready' $watcher.Permission.ToString()
-            Phase 'status-after-start'
-            Phase 'status-after-ready' $watcher.Status.ToString()
-            Phase 'position-unknown-start'
-            $unknown = $watcher.Position.Location.IsUnknown
-            Phase 'position-unknown-ready' ('unknown=' + $unknown.ToString())
-          } catch {
-            Phase 'api-error' $_.Exception.GetType().FullName
-          } finally {
-            if ($null -ne $watcher) {
-              try { Phase 'stop-start'; $watcher.Stop(); Phase 'stop-ready' } catch { Phase 'stop-error' $_.Exception.GetType().FullName }
-              try { Phase 'dispose-start'; $watcher.Dispose(); Phase 'dispose-ready' } catch { Phase 'dispose-error' $_.Exception.GetType().FullName }
-            }
-          }
-          Phase 'json-start'
-          __OUTPUT_JSON__
-          Phase 'json-ready'
-          Phase 'done'
-          '@
-          $gac = Join-Path $env:SystemRoot 'Microsoft.NET\assembly\GAC_MSIL\System.Device'
-          $assemblies = @([IO.Directory]::EnumerateFiles($gac, 'System.Device.dll', [IO.SearchOption]::AllDirectories))
-          if ($assemblies.Count -ne 1) { Write-Output 'phase=trusted-assembly-discovery|ms=0|type=not-unique'; exit 1 }
-          $assemblyLiteral = "'" + $assemblies[0].Replace("'", "''") + "'"
-          foreach ($variant in @('STA-full-name', 'STA-minimal-dotnet', 'STA-allowlist-dotnet', 'STA-allowlist-json')) {
-            $pieces = $variant -split '-'
-            $apartment = $pieces[0]
-            $suppress = '$true'
-            $seconds = '5'
-            $loader = if ($pieces[2] -eq 'name') { 'Add-Type -AssemblyName System.Device' } else { '$null = [Reflection.Assembly]::LoadFrom(' + $assemblyLiteral + ')' }
-            $constructor = '[System.Device.Location.GeoCoordinateWatcher]::new([System.Device.Location.GeoPositionAccuracy]::Default)'
-            $json = if ($pieces[2] -eq 'json') { '$value = @{api="Windows.Location";status="unavailable"} | ConvertTo-Json -Compress; [Console]::Out.WriteLine("protocol=" + $value)' } else { '[Console]::Out.WriteLine(''protocol={"api":"Windows.Location","status":"unavailable"}'')' }
-            $detail = 'suppressPrompt=' + $suppress.TrimStart('$') + ':timeoutSeconds=' + $seconds
-            $variantCode = $code.Replace('__ASSEMBLY_LOAD__', $loader).Replace('__CONSTRUCTOR__', $constructor).Replace('__OUTPUT_JSON__', $json).Replace('__SUPPRESS__', $suppress).Replace('__SECONDS__', $seconds).Replace('__DETAIL__', $detail)
-            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($variantCode))
-            $start = [Diagnostics.ProcessStartInfo]::new()
-            $start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $start.Arguments = '-NoLogo -NoProfile -NonInteractive -' + $apartment + ' -EncodedCommand ' + $encoded
-            $start.UseShellExecute = $false
-            if ($pieces[1] -eq 'minimal') {
-              $start.Environment.Clear()
-              $start.Environment['SystemRoot'] = $env:SystemRoot
-              $start.Environment['WINDIR'] = $env:SystemRoot
-              $start.Environment['TEMP'] = $env:TEMP
-              $start.Environment['TMP'] = $env:TMP
-            }
-            if ($pieces[1] -eq 'allowlist') {
-              $start.Environment.Clear()
-              foreach ($name in @('SystemRoot','WINDIR','TEMP','TMP','SystemDrive','USERPROFILE','LOCALAPPDATA','APPDATA','ProgramData','ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','CommonProgramFiles(x86)','COMSPEC','USERNAME','USERDOMAIN','COMPUTERNAME','HOMEDRIVE','HOMEPATH')) {
-                $value = [Environment]::GetEnvironmentVariable($name)
-                if ($null -ne $value) { $start.Environment[$name] = $value }
+              # Only the OS-owned GAC is searched. Never accept a DLL path from IPC/env,
+              # current directory or PATH; do not guess a particular framework version.
+              $windows = [IO.Directory]::GetParent([Environment]::SystemDirectory).FullName
+              $gac = [IO.Path]::Combine($windows, 'Microsoft.NET\assembly\GAC_MSIL\System.Device')
+              $reparse = [IO.FileAttributes]::ReparsePoint
+              if (([IO.File]::GetAttributes($gac) -band $reparse) -ne 0) { throw [InvalidOperationException]::new() }
+              $versions = [IO.Directory]::GetDirectories($gac)
+              if ($versions.Length -lt 1 -or $versions.Length -gt 8) { throw [InvalidOperationException]::new() }
+              $assemblyPath = $null
+              foreach ($version in $versions) {
+                  if (([IO.File]::GetAttributes($version) -band $reparse) -ne 0) { throw [InvalidOperationException]::new() }
+                  $candidate = [IO.Path]::Combine($version, 'System.Device.dll')
+                  if ([IO.File]::Exists($candidate)) {
+                      if ($null -ne $assemblyPath -or ([IO.File]::GetAttributes($candidate) -band $reparse) -ne 0) { throw [InvalidOperationException]::new() }
+                      $assemblyPath = $candidate
+                  }
               }
-              $start.Environment['PSModulePath'] = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-            }
-            $start.CreateNoWindow = $true
-            $start.RedirectStandardOutput = $true
-            $start.RedirectStandardError = $true
-            $process = [Diagnostics.Process]::new()
-            $process.StartInfo = $start
-            $clock = [Diagnostics.Stopwatch]::StartNew()
-            [void]$process.Start()
-            $outTask = $process.StandardOutput.ReadToEndAsync()
-            $errTask = $process.StandardError.ReadToEndAsync()
-            $finished = $process.WaitForExit(30000)
-            if (-not $finished) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null }
-            $output = $outTask.GetAwaiter().GetResult()
-            $errors = $errTask.GetAwaiter().GetResult()
-            Write-Output ('probe={0}|phase=process-end|ms={1}|type=finished:{2}:exit:{3}' -f $variant, $clock.ElapsedMilliseconds, $finished, $process.ExitCode)
-            foreach ($line in ($output -split "`r?`n")) {
-              if ($line -match '^phase=[a-z-]+\|ms=[0-9]+\|type=[A-Za-z0-9.+:=-]+$') { Write-Output ('probe=' + $variant + '|' + $line) }
-            }
-            $hasProtocol = $output.Contains('protocol={"api":"Windows.Location","status":"unavailable"}') -or $output.Contains('protocol={"status":"unavailable","api":"Windows.Location"}')
-            Write-Output ('probe=' + $variant + '|phase=protocol|ms=0|type=valid:' + $hasProtocol.ToString())
-            if ($errors.Length -gt 0) { Write-Output ('probe=' + $variant + '|phase=stderr|ms=0|type=present') }
-            $process.Dispose()
+              if ($null -eq $assemblyPath -or [Reflection.AssemblyName]::GetAssemblyName($assemblyPath).Name -ne 'System.Device') { throw [InvalidOperationException]::new() }
+              $null = [Reflection.Assembly]::LoadFrom($assemblyPath)
+              $watcher = [System.Device.Location.GeoCoordinateWatcher]::new([System.Device.Location.GeoPositionAccuracy]::Default)
+              $ready = $true
+              $status = 'unavailable'
+              $clock = [Diagnostics.Stopwatch]::StartNew()
+              # App consent is explicit; never open a hidden legacy permission dialog.
+              # OS denial is still enforced by the Windows Location Service.
+              $started = $watcher.TryStart($true, [TimeSpan]::FromSeconds(5))
+              if ($started) {
+                  # TryStart means provider started, not that its first fix is ready.
+                  # Wait briefly for one fix, with no subscription/event handlers.
+                  while ($clock.ElapsedMilliseconds -lt 8000) {
+                      if ($watcher.Permission -eq [System.Device.Location.GeoPositionPermission]::Denied) { $status = 'denied'; break }
+                      $coordinate = $watcher.Position.Location
+                      if (-not $coordinate.IsUnknown) {
+                          $latitude = $coordinate.Latitude
+                          $longitude = $coordinate.Longitude
+                          if (-not [Double]::IsNaN($latitude) -and -not [Double]::IsInfinity($latitude) -and
+                              -not [Double]::IsNaN($longitude) -and -not [Double]::IsInfinity($longitude) -and
+                              $latitude -ge -90 -and $latitude -le 90 -and $longitude -ge -180 -and $longitude -le 180) {
+                              $culture = [Globalization.CultureInfo]::InvariantCulture
+                              $lat = [Math]::Round($latitude, 2).ToString('0.##', $culture)
+                              $lon = [Math]::Round($longitude, 2).ToString('0.##', $culture)
+                              $coordinateJSON = '{"api":"Windows.Location","status":"ok","latitude":' + $lat + ',"longitude":' + $lon + '}'
+                              $status = 'ok'
+                          }
+                          break
+                      }
+                      if ($watcher.Status -eq [System.Device.Location.GeoPositionStatus]::Disabled -or $watcher.Status -eq [System.Device.Location.GeoPositionStatus]::NoData) { break }
+                      [Threading.Thread]::Sleep(100)
+                  }
+              }
+              if ($watcher.Permission -eq [System.Device.Location.GeoPositionPermission]::Denied) { $status = 'denied'; $coordinateJSON = $null }
+          } catch {
+              # Do not emit exception text: it is not part of the protocol.
+              if ($ready) { $status = 'unavailable' }
+              $coordinateJSON = $null
+          } finally {
+              if ($null -ne $watcher) {
+                  try { $watcher.Stop() } catch { $status = 'unavailable'; $coordinateJSON = $null }
+                  try { $watcher.Dispose() } catch { $status = 'unavailable'; $coordinateJSON = $null }
+              }
           }
+          if ($status -eq 'ok' -and $null -ne $coordinateJSON) { [Console]::Out.Write($coordinateJSON) }
+          else { [Console]::Out.Write('{"api":"Windows.Location","status":"' + $status + '"}') }
+          '@
+          $start = [Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $start.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+          $start.Environment.Clear()
+          $start.Environment['SystemRoot'] = $env:SystemRoot
+          $start.Environment['WINDIR'] = $env:SystemRoot
+          $start.Environment['TEMP'] = $env:TEMP
+          $start.Environment['TMP'] = $env:TMP
+          $start.UseShellExecute = $false
+          $start.CreateNoWindow = $true
+          $start.RedirectStandardInput = $true
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $process = [Diagnostics.Process]::new()
+          $process.StartInfo = $start
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          [void]$process.Start()
+          $process.StandardInput.Close()
+          $outTask = $process.StandardOutput.ReadToEndAsync()
+          $errTask = $process.StandardError.ReadToEndAsync()
+          $finished = $process.WaitForExit(30000)
+          if (-not $finished) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null }
+          $duration = $clock.ElapsedMilliseconds
+          $output = $outTask.GetAwaiter().GetResult()
+          $errors = $errTask.GetAwaiter().GetResult()
+          $safeStatus = 'invalid-response'
+          try {
+            $response = $output | ConvertFrom-Json -ErrorAction Stop
+            if ($response.api -eq 'Windows.Location' -and $response.status -in @('denied','unavailable','api-error')) { $safeStatus = $response.status }
+          } catch {}
+          $valid = $finished -and $process.ExitCode -eq 0 -and $duration -lt 18000 -and $safeStatus -in @('denied','unavailable') -and $errors.Length -eq 0
+          Write-Output ('phase=final-helper|ms={0}|type=status:{1}:finished:{2}:valid:{3}' -f $duration,$safeStatus,$finished,$valid)
+          $process.Dispose()
+          if (-not $valid) { exit 1 }
