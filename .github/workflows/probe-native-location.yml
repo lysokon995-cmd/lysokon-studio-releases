@@ -61,11 +61,19 @@ jobs:
           Phase 'done'
           '@
           $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
-          foreach ($apartment in @('STA', 'MTA')) {
+          foreach ($variant in @('STA-full', 'MTA-full', 'STA-minimal')) {
+            $apartment = ($variant -split '-')[0]
             $start = [Diagnostics.ProcessStartInfo]::new()
             $start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
             $start.Arguments = '-NoLogo -NoProfile -NonInteractive -' + $apartment + ' -EncodedCommand ' + $encoded
             $start.UseShellExecute = $false
+            if ($variant -eq 'STA-minimal') {
+              $start.Environment.Clear()
+              $start.Environment['SystemRoot'] = $env:SystemRoot
+              $start.Environment['WINDIR'] = $env:SystemRoot
+              $start.Environment['TEMP'] = $env:TEMP
+              $start.Environment['TMP'] = $env:TMP
+            }
             $start.CreateNoWindow = $true
             $start.RedirectStandardOutput = $true
             $start.RedirectStandardError = $true
@@ -79,10 +87,10 @@ jobs:
             if (-not $finished) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null }
             $output = $outTask.GetAwaiter().GetResult()
             $errors = $errTask.GetAwaiter().GetResult()
-            Write-Output ('probe={0}|phase=process-end|ms={1}|type=finished:{2}:exit:{3}' -f $apartment, $clock.ElapsedMilliseconds, $finished, $process.ExitCode)
+            Write-Output ('probe={0}|phase=process-end|ms={1}|type=finished:{2}:exit:{3}' -f $variant, $clock.ElapsedMilliseconds, $finished, $process.ExitCode)
             foreach ($line in ($output -split "`r?`n")) {
-              if ($line -match '^phase=[a-z-]+\|ms=[0-9]+\|type=[A-Za-z0-9.+:=-]+$') { Write-Output ('probe=' + $apartment + '|' + $line) }
+              if ($line -match '^phase=[a-z-]+\|ms=[0-9]+\|type=[A-Za-z0-9.+:=-]+$') { Write-Output ('probe=' + $variant + '|' + $line) }
             }
-            if ($errors.Length -gt 0) { Write-Output ('probe=' + $apartment + '|phase=stderr|ms=0|type=present') }
+            if ($errors.Length -gt 0) { Write-Output ('probe=' + $variant + '|phase=stderr|ms=0|type=present') }
             $process.Dispose()
           }
