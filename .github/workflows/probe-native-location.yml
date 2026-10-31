@@ -5,7 +5,7 @@ permissions:
   contents: read
 jobs:
   location-phases:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 5
     steps:
       - name: Disable location on the disposable runner and probe bounded native phases
@@ -39,17 +39,16 @@ jobs:
             Phase 'constructor-start'
             $watcher = New-Object System.Device.Location.GeoCoordinateWatcher ([System.Device.Location.GeoPositionAccuracy]::Default)
             Phase 'constructor-ready' $watcher.GetType().FullName
-            Phase 'permission-before-start'
-            Phase 'permission-before-ready' $watcher.Permission.ToString()
-            Phase 'status-before-start'
-            Phase 'status-before-ready' $watcher.Status.ToString()
-            Phase 'try-start' 'suppressPrompt=true:timeoutMs=5000'
-            $started = $watcher.TryStart($true, [TimeSpan]::FromSeconds(5))
+            Phase 'try-start' '__DETAIL__'
+            $started = $watcher.TryStart(__SUPPRESS__, [TimeSpan]::FromSeconds(__SECONDS__))
             Phase 'try-ready' ('started=' + $started.ToString())
             Phase 'permission-after-start'
             Phase 'permission-after-ready' $watcher.Permission.ToString()
             Phase 'status-after-start'
             Phase 'status-after-ready' $watcher.Status.ToString()
+            Phase 'position-unknown-start'
+            $unknown = $watcher.Position.Location.IsUnknown
+            Phase 'position-unknown-ready' ('unknown=' + $unknown.ToString())
           } catch {
             Phase 'api-error' $_.Exception.GetType().FullName
           } finally {
@@ -60,14 +59,19 @@ jobs:
           }
           Phase 'done'
           '@
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
-          foreach ($variant in @('STA-full', 'MTA-full', 'STA-minimal')) {
-            $apartment = ($variant -split '-')[0]
+          foreach ($variant in @('STA-full-true5', 'STA-minimal-true5', 'STA-minimal-false15', 'MTA-minimal-false15')) {
+            $pieces = $variant -split '-'
+            $apartment = $pieces[0]
+            $suppress = if ($pieces[2] -eq 'true5') { '$true' } else { '$false' }
+            $seconds = if ($pieces[2] -eq 'true5') { '5' } else { '15' }
+            $detail = 'suppressPrompt=' + $suppress.TrimStart('$') + ':timeoutSeconds=' + $seconds
+            $variantCode = $code.Replace('__SUPPRESS__', $suppress).Replace('__SECONDS__', $seconds).Replace('__DETAIL__', $detail)
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($variantCode))
             $start = [Diagnostics.ProcessStartInfo]::new()
             $start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
             $start.Arguments = '-NoLogo -NoProfile -NonInteractive -' + $apartment + ' -EncodedCommand ' + $encoded
             $start.UseShellExecute = $false
-            if ($variant -eq 'STA-minimal') {
+            if ($pieces[1] -eq 'minimal') {
               $start.Environment.Clear()
               $start.Environment['SystemRoot'] = $env:SystemRoot
               $start.Environment['WINDIR'] = $env:SystemRoot
