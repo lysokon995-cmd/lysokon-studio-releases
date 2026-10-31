@@ -5,7 +5,11 @@ permissions:
   contents: read
 jobs:
   location-phases:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - name: Disable location on the disposable runner and probe bounded native phases
@@ -59,7 +63,7 @@ jobs:
           }
           Phase 'done'
           '@
-          foreach ($variant in @('STA-full-true5', 'STA-minimal-true5', 'STA-minimal-false15', 'MTA-minimal-false15')) {
+          foreach ($variant in @('STA-full-true5', 'STA-minimal-true5', 'STA-allowlist-true5')) {
             $pieces = $variant -split '-'
             $apartment = $pieces[0]
             $suppress = if ($pieces[2] -eq 'true5') { '$true' } else { '$false' }
@@ -77,6 +81,14 @@ jobs:
               $start.Environment['WINDIR'] = $env:SystemRoot
               $start.Environment['TEMP'] = $env:TEMP
               $start.Environment['TMP'] = $env:TMP
+            }
+            if ($pieces[1] -eq 'allowlist') {
+              $start.Environment.Clear()
+              foreach ($name in @('SystemRoot','WINDIR','TEMP','TMP','SystemDrive','USERPROFILE','LOCALAPPDATA','APPDATA','ProgramData','ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','CommonProgramFiles(x86)','COMSPEC','USERNAME','USERDOMAIN','COMPUTERNAME','HOMEDRIVE','HOMEPATH')) {
+                $value = [Environment]::GetEnvironmentVariable($name)
+                if ($null -ne $value) { $start.Environment[$name] = $value }
+              }
+              $start.Environment['PSModulePath'] = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
             }
             $start.CreateNoWindow = $true
             $start.RedirectStandardOutput = $true
