@@ -145,10 +145,26 @@ jobs:
             if ((Get-FileHash -Algorithm SHA256 (Join-Path $env:SMOKE_ROOT 'profile/settings.json')).Hash -ne $env:UPGRADE_SETTINGS_HASH) { throw 'Installer changed notification settings.' }
           }
 
+      - name: Disable location only on the disposable Windows test runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Exercise real OS-denied/unavailable behavior without collecting the
+          # runner's position, Google API keys, billing, or synthetic coordinates.
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'
+          New-Item -Path $policy -Force | Out-Null
+          New-ItemProperty -Path $policy -Name DisableLocation -PropertyType DWord -Value 1 -Force | Out-Null
+          $service = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
+          if ($service) {
+            Stop-Service -Name lfsvc -Force -ErrorAction Stop
+            Set-Service -Name lfsvc -StartupType Disabled
+          }
+
       - name: Launch installed build and verify actual inference
         shell: pwsh
         env:
           CI: 'true'
+          LYSOKON_SMOKE_LOCATION_DENIED: '1'
           LYSOKON_SMOKE_INFERENCE: ${{ inputs.inference && '1' || '0' }}
         run: |
           $ErrorActionPreference = 'Stop'
