@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "scope": "bundled mobile/web JavaScript runtime",
+  "packages": [
+    {
+      "name": "@capacitor/core",
+      "version": "8.6.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@firebase/app",
+      "version": "0.16.4",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "@firebase/auth",
+      "version": "1.13.8",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "@firebase/component",
+      "version": "0.7.5",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "@firebase/logger",
+      "version": "0.5.2",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "@firebase/util",
+      "version": "1.15.3",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "firebase",
+      "version": "13.1.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "idb",
+      "version": "7.1.1",
+      "license": "ISC"
+    }
+  ],
+  "timezoneLookup": {
+    "name": "@photostructure/tz-lookup",
+    "version": "11.7.0",
+    "license": "CC0-1.0"
+  }
+}
