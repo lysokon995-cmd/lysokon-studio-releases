@@ -51,6 +51,11 @@
       "name": "@firebase/webchannel-wrapper",
       "version": "1.0.7",
       "license": "Apache-2.0"
+    },
+    {
+      "name": "@capacitor/local-notifications",
+      "version": "8.3.1",
+      "license": "MIT"
     }
   ],
   "timezoneLookup": {
