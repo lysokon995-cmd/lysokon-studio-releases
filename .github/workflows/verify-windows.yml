@@ -95,10 +95,16 @@ jobs:
           Get-Process -Name Novy -ErrorAction SilentlyContinue | Stop-Process -Force
           $executables = @(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Filter 'Novy.exe' -File)
           if ($executables.Count -ne 1) { throw 'Expected one previous application.' }
+          # The prior build also enforces chat readiness. Its no-inference smoke
+          # must receive the same verified weights as the new profile.
+          $priorModels = Join-Path $env:SMOKE_ROOT 'previous/profile/AI/Models'
+          New-Item -ItemType Directory -Force -Path $priorModels | Out-Null
+          if (-not (Test-Path $env:MODEL_CACHE)) { throw 'The predecessor chat check requires the restored model cache.' }
+          Get-ChildItem -LiteralPath $env:MODEL_CACHE -Force | Copy-Item -Destination $priorModels -Recurse -Force
           $env:LYSOKON_SMOKE_REPORT = Join-Path $env:SMOKE_ROOT 'previous/report.json'
-          $process = Start-Process -FilePath $executables[0].FullName -ArgumentList '--smoke-test' -PassThru
+          $process = Start-Process -FilePath $executables[0].FullName -ArgumentList '--smoke-test', '--enable-logging=stderr' -PassThru -RedirectStandardOutput (Join-Path $env:SMOKE_ROOT 'previous/stdout.log') -RedirectStandardError (Join-Path $env:SMOKE_ROOT 'previous/stderr.log')
           if (-not $process.WaitForExit(180000)) { $process.Kill($true); throw 'Previous application check timed out.' }
-          if ($process.ExitCode -ne 0) { throw 'Previous application could not save its test data.' }
+          if ($process.ExitCode -ne 0) { if (Test-Path $env:LYSOKON_SMOKE_REPORT) { Get-Content -Raw $env:LYSOKON_SMOKE_REPORT }; throw 'Previous application could not save its test data.' }
           $prior = Get-Content -Raw $env:LYSOKON_SMOKE_REPORT | ConvertFrom-Json
           if (-not $prior.ok) { throw 'Previous application smoke failed.' }
           $oldProfile = Join-Path $env:SMOKE_ROOT 'previous/profile'
@@ -192,6 +198,8 @@ jobs:
         with:
           name: windows-smoke-${{ inputs.tag }}
           path: |
+            ${{ env.SMOKE_ROOT }}/previous/report.json
+            ${{ env.SMOKE_ROOT }}/previous/*.log
             ${{ env.SMOKE_ROOT }}/report.json
             ${{ env.SMOKE_ROOT }}/installer-sha256.json
             ${{ env.SMOKE_ROOT }}/upgrade.json
